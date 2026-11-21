@@ -2,9 +2,21 @@ name: Build llama.cpp for Android (Termux)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    tags: ['v*']
+    inputs:
+      tag_name:
+        description: 'Tên tag (để trống sẽ tự sinh theo timestamp)'
+        required: false
+        type: string
+      release_name:
+        description: 'Tên hiển thị của release (để trống sẽ dùng tag_name)'
+        required: false
+        type: string
+      make_latest:
+        description: 'Đánh dấu là bản release mới nhất?'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
 
 permissions:
   contents: write
@@ -33,7 +45,7 @@ jobs:
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: llama-android-${{ github.sha }}
+          key: llama-android-master
           max-size: 2G
 
       - name: Configure CMake
@@ -61,44 +73,35 @@ jobs:
 
       - name: Build
         working-directory: llama.cpp
-        run: |
-          cmake --build build-android --config Release -j$(nproc)
+        run: cmake --build build-android --config Release -j$(nproc)
 
-      - name: Prepare Termux package tree
+      - name: Prepare Termux package
         run: |
           PKG=llama-termux
           ROOT=$PKG/usr
-          mkdir -p $ROOT/bin $ROOT/lib $ROOT/share/llama-termux
+          mkdir -p $ROOT/bin $ROOT/lib
 
-          # Copy binary chính
           for b in llama-cli llama-server llama-bench; do
-            if [ -f llama.cpp/build-android/bin/$b ]; then
-              cp llama.cpp/build-android/bin/$b $ROOT/bin/
-            fi
+            [ -f llama.cpp/build-android/bin/$b ] && cp llama.cpp/build-android/bin/$b $ROOT/bin/
           done
-
-          # Copy shared libs nếu có (đề phòng BUILD_SHARED_LIBS bị override)
           find llama.cpp/build-android -name '*.so' -exec cp {} $ROOT/lib/ \; 2>/dev/null || true
 
-          # Script kiểm tra RAM trống tối thiểu
           cat > $ROOT/bin/llama-check-ram <<'EOF'
           #!/data/data/com.termux/files/usr/bin/bash
           MIN_MB=${1:-2048}
-          AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-          AVAIL_MB=$((AVAIL_KB / 1024))
+          AVAIL_MB=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 1024 ))
           if [ "$AVAIL_MB" -lt "$MIN_MB" ]; then
-              echo "[CẢNH BÁO] RAM trống: ${AVAIL_MB}MB < ${MIN_MB}MB. Đóng bớt ứng dụng hoặc dùng mô hình nhỏ hơn."
+              echo "[CẢNH BÁO] RAM trống: ${AVAIL_MB}MB < ${MIN_MB}MB."
               exit 1
           fi
           echo "[OK] RAM trống: ${AVAIL_MB}MB."
           EOF
           chmod +x $ROOT/bin/llama-check-ram
 
-          # Metadata gói
           mkdir -p $PKG/DEBIAN
           cat > $PKG/DEBIAN/control <<EOF
           Package: llama-termux
-          Version: ${GITHUB_SHA::7}
+          Version: 0.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}+${GITHUB_SHA::7}
           Architecture: aarch64
           Maintainer: nam348tnh3gp
           Section: utils
@@ -113,10 +116,42 @@ jobs:
         with:
           name: llama-termux-deb
           path: llama-termux.deb
-          retention-days: 30
+          retention-days: 7
 
-      - name: Release (nếu là tag)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Resolve tag & release name
+        id: meta
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="build-$(date -u +%Y%m%d-%H%M%S)-r${GITHUB_RUN_NUMBER}"
+          fi
+          NAME="${{ inputs.release_name }}"
+          if [ -z "$NAME" ]; then
+            NAME="$TAG"
+          fi
+          echo "tag=$TAG"   >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+      - name: Create tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --tags origin "${{ steps.meta.outputs.tag }}" | grep -q .; then
+            echo "::error::Tag '${{ steps.meta.outputs.tag }}' đã tồn tại. Chọn tên khác."
+            exit 1
+          fi
+          git tag "${{ steps.meta.outputs.tag }}"
+          git push origin "${{ steps.meta.outputs.tag }}"
+
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          body: |
+            Build thủ công từ llama.cpp master.
+            - Commit: ${{ github.sha }}
+            - Run: #${{ github.run_number }}
+            - Yêu cầu: RAM trống ≥ 2GB, Termux arm64.
           files: llama-termux.deb
+          make_latest: ${{ inputs.make_latest == 'true' }}
