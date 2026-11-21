@@ -87,11 +87,23 @@ jobs:
           ROOT=$PKG/data/data/com.termux/files/usr
           mkdir -p $ROOT/bin $ROOT/lib
 
-          for b in llama-cli llama-server llama-bench; do
-            [ -f llama.cpp/build-android/bin/$b ] && cp llama.cpp/build-android/bin/$b $ROOT/bin/
-          done
-          find llama.cpp/build-android -name '*.so' -exec cp {} $ROOT/lib/ \; 2>/dev/null || true
+          STRIP=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 
+          # Copy và strip binary
+          for b in llama-cli llama-server llama-bench; do
+            if [ -f llama.cpp/build-android/bin/$b ]; then
+              cp llama.cpp/build-android/bin/$b $ROOT/bin/
+              $STRIP --strip-unneeded $ROOT/bin/$b
+            fi
+          done
+
+          # Copy và strip shared libs (nếu có)
+          find llama.cpp/build-android -name '*.so' -exec cp {} $ROOT/lib/ \; 2>/dev/null || true
+          for so in $ROOT/lib/*.so; do
+            [ -f "$so" ] && $STRIP --strip-unneeded "$so"
+          done
+
+          # Script kiểm tra RAM
           cat > $ROOT/bin/llama-check-ram <<'EOF'
           #!/data/data/com.termux/files/usr/bin/bash
           MIN_MB=${1:-2048}
@@ -104,6 +116,7 @@ jobs:
           EOF
           chmod +x $ROOT/bin/llama-check-ram
 
+          # Metadata gói
           mkdir -p $PKG/DEBIAN
           cat > $PKG/DEBIAN/control <<EOF
           Package: llama-termux
@@ -114,6 +127,9 @@ jobs:
           Priority: optional
           Description: llama.cpp binaries for Termux (arm64-v8a, KleidiAI)
           EOF
+
+          # Kiểm tra dung lượng trước khi đóng gói (debug)
+          du -sh $ROOT/bin/* $ROOT/lib/* 2>/dev/null || true
 
           dpkg-deb --build $PKG llama-termux.deb
 
