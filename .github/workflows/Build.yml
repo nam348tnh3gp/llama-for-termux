@@ -126,7 +126,7 @@ jobs:
             [
               {arch:"aarch64", abi:"arm64-v8a",   file_re:"ARM aarch64", kleidiai:"ON",  experimental:false},
               {arch:"arm",     abi:"armeabi-v7a", file_re:"ARM, EABI5",  kleidiai:"OFF", experimental:true},
-              {arch:"i686",    abi:"x86",         file_re:"Intel 80386", kleidiai:"OFF", experimental:true},
+              {arch:"i686",    abi:"x86",         file_re:"Intel (80386|i386)", kleidiai:"OFF", experimental:true},
               {arch:"x86_64",  abi:"x86_64",      file_re:"x86-64",      kleidiai:"OFF", experimental:false}
             ] as $all
             | ($list | split(",")) as $want
@@ -280,7 +280,7 @@ jobs:
           # Kiểm tra kiến trúc + in thư viện phụ thuộc
           for f in "$ROOT"/bin/llama-*; do
             [ -x "$f" ] || continue
-            if ! file "$f" | grep -q "$FILE_RE"; then
+            if ! file "$f" | grep -Eq "$FILE_RE"; then
               echo "::error::$f không khớp kiến trúc $ARCH (mong đợi: $FILE_RE)"
               file "$f"
               exit 1
