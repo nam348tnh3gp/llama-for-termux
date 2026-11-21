@@ -1,22 +1,28 @@
-name: Build llama.cpp for Android (Termux, 2GB RAM)
+name: Build llama.cpp for Android (Termux)
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
 
 jobs:
   build-android:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 60
+
     steps:
-      - name: Checkout repository
+      - name: Checkout llama.cpp
         uses: actions/checkout@v4
         with:
           repository: 'ggml-org/llama.cpp'
           ref: 'master'
           submodules: 'recursive'
           fetch-depth: 1
+          path: llama.cpp
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -24,30 +30,93 @@ jobs:
           ndk-version: r27d
           add-to-path: true
 
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: llama-android-${{ github.sha }}
+          max-size: 2G
+
       - name: Configure CMake
+        working-directory: llama.cpp
         run: |
           cmake -B build-android \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-28 \
             -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
             -DGGML_OPENMP=OFF \
             -DGGML_LLAMAFILE=OFF \
             -DLLAMA_CURL=OFF \
             -DLLAMA_OPENSSL=OFF \
-            -DGGML_CPU_ARM_ARCH="armv8.6-a+i8mm+dotprod+fp16" \
             -DGGML_CPU_KLEIDIAI=ON \
             -DGGML_LTO=ON \
             -DBUILD_SHARED_LIBS=OFF \
-            -DLLAMA_BUILD_COMMON=ON
+            -DLLAMA_BUILD_COMMON=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
+        working-directory: llama.cpp
         run: |
           cmake --build build-android --config Release -j$(nproc)
+
+      - name: Prepare Termux package tree
+        run: |
+          PKG=llama-termux
+          ROOT=$PKG/usr
+          mkdir -p $ROOT/bin $ROOT/lib $ROOT/share/llama-termux
+
+          # Copy binary chính
+          for b in llama-cli llama-server llama-bench; do
+            if [ -f llama.cpp/build-android/bin/$b ]; then
+              cp llama.cpp/build-android/bin/$b $ROOT/bin/
+            fi
+          done
+
+          # Copy shared libs nếu có (đề phòng BUILD_SHARED_LIBS bị override)
+          find llama.cpp/build-android -name '*.so' -exec cp {} $ROOT/lib/ \; 2>/dev/null || true
+
+          # Script kiểm tra RAM trống tối thiểu
+          cat > $ROOT/bin/llama-check-ram <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+          MIN_MB=${1:-2048}
+          AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+          AVAIL_MB=$((AVAIL_KB / 1024))
+          if [ "$AVAIL_MB" -lt "$MIN_MB" ]; then
+              echo "[CẢNH BÁO] RAM trống: ${AVAIL_MB}MB < ${MIN_MB}MB. Đóng bớt ứng dụng hoặc dùng mô hình nhỏ hơn."
+              exit 1
+          fi
+          echo "[OK] RAM trống: ${AVAIL_MB}MB."
+          EOF
+          chmod +x $ROOT/bin/llama-check-ram
+
+          # Metadata gói
+          mkdir -p $PKG/DEBIAN
+          cat > $PKG/DEBIAN/control <<EOF
+          Package: llama-termux
+          Version: ${GITHUB_SHA::7}
+          Architecture: aarch64
+          Maintainer: nam348tnh3gp
+          Section: utils
+          Priority: optional
+          Description: llama.cpp binaries for Termux (arm64-v8a, KleidiAI)
+          EOF
+
+          dpkg-deb --build $PKG llama-termux.deb
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama-android-arm64
-          path: build-android/bin/
-          retention-days: 7
+          name: llama-termux-deb
+          path: llama-termux.deb
+          retention-days: 30
+
+      - name: Release (nếu là tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: llama-termux.deb
