@@ -27,6 +27,12 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      - name: Checkout own repo (for tagging)
+        uses: actions/checkout@v4
+        with:
+          path: self-repo
+          fetch-depth: 0
+
       - name: Checkout llama.cpp
         uses: actions/checkout@v4
         with:
@@ -78,7 +84,7 @@ jobs:
       - name: Prepare Termux package
         run: |
           PKG=llama-termux
-          ROOT=$PKG/usr
+          ROOT=$PKG/data/data/com.termux/files/usr
           mkdir -p $ROOT/bin $ROOT/lib
 
           for b in llama-cli llama-server llama-bench; do
@@ -133,6 +139,7 @@ jobs:
           echo "name=$NAME" >> $GITHUB_OUTPUT
 
       - name: Create tag
+        working-directory: self-repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
