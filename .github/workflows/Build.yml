@@ -3,8 +3,18 @@ name: Build llama.cpp for Android (Termux)
 on:
   workflow_dispatch:
     inputs:
+      llama_ref:
+        description: 'Nhánh / tag / commit của llama.cpp (mặc định: master)'
+        required: false
+        default: 'master'
+        type: string
+      archs:
+        description: 'Kiến trúc cần build, cách nhau bằng dấu phẩy (aarch64,arm,i686,x86_64)'
+        required: false
+        default: 'aarch64,arm,i686,x86_64'
+        type: string
       tag_name:
-        description: 'Tên tag (để trống sẽ tự sinh theo timestamp)'
+        description: 'Tên tag (để trống sẽ tự sinh theo timestamp + commit llama.cpp)'
         required: false
         type: string
       release_name:
@@ -17,94 +27,276 @@ on:
         default: 'true'
         type: choice
         options: ['true', 'false']
+      prerelease:
+        description: 'Đánh dấu là pre-release?'
+        required: false
+        default: false
+        type: boolean
+      cpu_arch:
+        description: '[chỉ aarch64] GGML_CPU_ARM_ARCH (để trống = baseline armv8-a). Ví dụ: armv8.2-a+dotprod'
+        required: false
+        default: ''
+        type: string
+      x86_avx2:
+        description: '[chỉ x86_64] Bật AVX2/FMA/F16C (chỉ dùng nếu CPU hỗ trợ, nếu không sẽ lỗi Illegal instruction)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-android-termux
+  cancel-in-progress: false
+
+env:
+  PKG_NAME: llama-termux
+
 jobs:
-  build-android:
+  # ---------------------------------------------------------------------------
+  # Chốt một lần: commit llama.cpp, tag, version, ma trận kiến trúc.
+  # Mọi job build dùng chung đúng một commit llama.cpp (tránh master đổi giữa chừng).
+  # ---------------------------------------------------------------------------
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    outputs:
+      matrix: ${{ steps.meta.outputs.matrix }}
+      required: ${{ steps.meta.outputs.required }}
+      tag: ${{ steps.meta.outputs.tag }}
+      name: ${{ steps.meta.outputs.name }}
+      version: ${{ steps.meta.outputs.version }}
+      llama_sha: ${{ steps.meta.outputs.llama_sha }}
+      llama_full: ${{ steps.meta.outputs.llama_full }}
 
     steps:
-      - name: Checkout own repo (for tagging)
+      - name: Checkout own repo (for tag check)
         uses: actions/checkout@v4
         with:
           path: self-repo
           fetch-depth: 0
 
+      - name: Checkout llama.cpp (chỉ để chốt commit)
+        uses: actions/checkout@v4
+        with:
+          repository: 'ggml-org/llama.cpp'
+          ref: ${{ inputs.llama_ref || 'master' }}
+          fetch-depth: 1
+          sparse-checkout: README.md
+          path: llama.cpp
+
+      - name: Resolve metadata
+        id: meta
+        env:
+          IN_TAG: ${{ inputs.tag_name }}
+          IN_NAME: ${{ inputs.release_name }}
+          IN_ARCHS: ${{ inputs.archs }}
+        run: |
+          set -euo pipefail
+          LLAMA_SHA=$(git -C llama.cpp rev-parse --short=7 HEAD)
+          LLAMA_FULL=$(git -C llama.cpp rev-parse HEAD)
+          DATE=$(date -u +%Y%m%d)
+
+          # --- tag ---
+          TAG="$IN_TAG"
+          if [ -z "$TAG" ]; then
+            TAG="build-$(date -u +%Y%m%d-%H%M%S)-r${GITHUB_RUN_NUMBER}-${LLAMA_SHA}"
+          fi
+          if ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "::error::Tag '$TAG' chứa ký tự không hợp lệ (chỉ cho phép A-Z a-z 0-9 . _ -)."
+            exit 1
+          fi
+          if git -C self-repo ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "::error::Tag '$TAG' đã tồn tại. Chọn tên khác."
+            exit 1
+          fi
+          NAME="${IN_NAME:-$TAG}"
+          VERSION="0.${DATE}.${GITHUB_RUN_NUMBER}.${LLAMA_SHA}"
+
+          # --- ma trận kiến trúc ---
+          ARCHS="$(printf '%s' "$IN_ARCHS" | tr -d '[:space:]')"
+          for a in ${ARCHS//,/ }; do
+            case "$a" in
+              aarch64|arm|i686|x86_64) ;;
+              *) echo "::error::Kiến trúc không hợp lệ: '$a' (chỉ hỗ trợ aarch64, arm, i686, x86_64)"; exit 1 ;;
+            esac
+          done
+
+          MATRIX=$(jq -cn --arg list "$ARCHS" '
+            [
+              {arch:"aarch64", abi:"arm64-v8a",   file_re:"ARM aarch64", kleidiai:"ON",  experimental:false},
+              {arch:"arm",     abi:"armeabi-v7a", file_re:"ARM, EABI5",  kleidiai:"OFF", experimental:true},
+              {arch:"i686",    abi:"x86",         file_re:"Intel 80386", kleidiai:"OFF", experimental:true},
+              {arch:"x86_64",  abi:"x86_64",      file_re:"x86-64",      kleidiai:"OFF", experimental:false}
+            ] as $all
+            | ($list | split(",")) as $want
+            | {include: [ $all[] | select(.arch as $a | $want | index($a)) ]}')
+
+          if [ "$(jq '.include | length' <<<"$MATRIX")" -eq 0 ]; then
+            echo "::error::Không có kiến trúc nào được chọn."
+            exit 1
+          fi
+          REQUIRED=$(jq -r '[.include[] | select(.experimental | not) | .arch] | join(" ")' <<<"$MATRIX")
+
+          {
+            echo "matrix=$MATRIX"
+            echo "required=$REQUIRED"
+            echo "tag=$TAG"
+            echo "name=$NAME"
+            echo "version=$VERSION"
+            echo "llama_sha=$LLAMA_SHA"
+            echo "llama_full=$LLAMA_FULL"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "llama.cpp commit: $LLAMA_FULL"
+          echo "Tag: $TAG | Version: $VERSION"
+          echo "Matrix: $MATRIX"
+
+  # ---------------------------------------------------------------------------
+  # Build từng kiến trúc song song. arm và i686 là experimental:
+  # nếu build lỗi thì bị bỏ qua, các kiến trúc còn lại vẫn được phát hành.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
       - name: Checkout llama.cpp
         uses: actions/checkout@v4
         with:
           repository: 'ggml-org/llama.cpp'
-          ref: 'master'
+          ref: ${{ needs.prepare.outputs.llama_full }}
           submodules: 'recursive'
           fetch-depth: 1
           path: llama.cpp
 
       - name: Setup Android NDK
+        id: ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27d
           add-to-path: true
 
+      - name: Locate NDK
+        run: |
+          set -euo pipefail
+          NDK_DIR="${{ steps.ndk.outputs.ndk-path }}"
+          NDK_DIR="${NDK_DIR:-${ANDROID_NDK_HOME:-${ANDROID_NDK:-}}}"
+          if [ ! -f "$NDK_DIR/build/cmake/android.toolchain.cmake" ]; then
+            echo "::error::Không tìm thấy toolchain file của NDK tại '$NDK_DIR'."
+            exit 1
+          fi
+          echo "NDK=$NDK_DIR" >> "$GITHUB_ENV"
+
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: llama-android-master
+          key: llama-android-termux-${{ matrix.arch }}
           max-size: 2G
 
       - name: Configure CMake
         working-directory: llama.cpp
+        env:
+          ARCH: ${{ matrix.arch }}
+          ABI: ${{ matrix.abi }}
+          KLEIDIAI: ${{ matrix.kleidiai }}
+          CPU_ARCH: ${{ inputs.cpu_arch }}
+          X86_AVX2: ${{ inputs.x86_avx2 }}
         run: |
-          cmake -B build-android \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-28 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_NATIVE=OFF \
-            -DGGML_OPENMP=OFF \
-            -DGGML_LLAMAFILE=OFF \
-            -DLLAMA_CURL=OFF \
-            -DLLAMA_OPENSSL=OFF \
-            -DGGML_CPU_KLEIDIAI=ON \
-            -DGGML_LTO=ON \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DLLAMA_BUILD_COMMON=ON \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DLLAMA_BUILD_SERVER=ON \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          set -euo pipefail
+          ARGS=(
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake"
+            -DANDROID_ABI="$ABI"
+            -DANDROID_PLATFORM=android-28
+            -DCMAKE_BUILD_TYPE=Release
+            -DGGML_NATIVE=OFF
+            -DGGML_OPENMP=OFF
+            -DGGML_LLAMAFILE=OFF
+            -DLLAMA_CURL=OFF
+            -DLLAMA_OPENSSL=OFF
+            -DGGML_CPU_KLEIDIAI="$KLEIDIAI"
+            -DGGML_LTO=ON
+            -DBUILD_SHARED_LIBS=OFF
+            -DLLAMA_BUILD_COMMON=ON
+            -DLLAMA_BUILD_TESTS=OFF
+            -DLLAMA_BUILD_EXAMPLES=OFF
+            -DLLAMA_BUILD_SERVER=ON
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          )
+          if [ "$ARCH" = aarch64 ] && [ -n "$CPU_ARCH" ]; then
+            ARGS+=("-DGGML_CPU_ARM_ARCH=$CPU_ARCH")
+            echo "Dùng GGML_CPU_ARM_ARCH=$CPU_ARCH"
+          fi
+          if [ "$ARCH" = x86_64 ] && [ "$X86_AVX2" = "true" ]; then
+            ARGS+=(-DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON)
+            echo "Bật AVX2/FMA/F16C cho x86_64"
+          fi
+          cmake -B build-android "${ARGS[@]}"
 
       - name: Build
         working-directory: llama.cpp
-        run: cmake --build build-android --config Release -j$(nproc)
+        run: cmake --build build-android --config Release -j"$(nproc)"
 
       - name: Prepare Termux package
+        env:
+          ARCH: ${{ matrix.arch }}
+          FILE_RE: ${{ matrix.file_re }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          LLAMA_SHA: ${{ needs.prepare.outputs.llama_sha }}
         run: |
-          PKG=llama-termux
-          ROOT=$PKG/data/data/com.termux/files/usr
-          mkdir -p $ROOT/bin $ROOT/lib
+          set -euo pipefail
+          PKG="pkg-$ARCH"
+          ROOT="$PKG/data/data/com.termux/files/usr"
+          BIN_SRC=llama.cpp/build-android/bin
+          LLVM_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          STRIP="$LLVM_BIN/llvm-strip"
+          READELF="$LLVM_BIN/llvm-readelf"
+          mkdir -p "$ROOT/bin" "$ROOT/lib" dist
 
-          STRIP=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
-
-          # Copy và strip binary
-          for b in llama-cli llama-server llama-bench; do
-            if [ -f llama.cpp/build-android/bin/$b ]; then
-              cp llama.cpp/build-android/bin/$b $ROOT/bin/
-              $STRIP --strip-unneeded $ROOT/bin/$b
+          # Binary bắt buộc: thiếu là fail
+          for b in llama-cli llama-server; do
+            if [ ! -f "$BIN_SRC/$b" ]; then
+              echo "::error::Thiếu binary bắt buộc: $b"
+              ls -la "$BIN_SRC" || true
+              exit 1
             fi
           done
 
-          # Copy và strip shared libs (nếu có)
-          find llama.cpp/build-android -name '*.so' -exec cp {} $ROOT/lib/ \; 2>/dev/null || true
-          for so in $ROOT/lib/*.so; do
-            [ -f "$so" ] && $STRIP --strip-unneeded "$so"
+          # Binary tùy chọn: có thì đóng gói
+          for b in llama-cli llama-server llama-bench llama-quantize; do
+            if [ -f "$BIN_SRC/$b" ]; then
+              cp "$BIN_SRC/$b" "$ROOT/bin/"
+              "$STRIP" --strip-unneeded "$ROOT/bin/$b"
+            fi
+          done
+
+          # Kiểm tra kiến trúc + in thư viện phụ thuộc
+          for f in "$ROOT"/bin/llama-*; do
+            [ -x "$f" ] || continue
+            if ! file "$f" | grep -q "$FILE_RE"; then
+              echo "::error::$f không khớp kiến trúc $ARCH (mong đợi: $FILE_RE)"
+              file "$f"
+              exit 1
+            fi
+            echo "== $(basename "$f") =="
+            "$READELF" -d "$f" | grep NEEDED || true
+          done
+
+          # Shared libs (chỉ có nếu BUILD_SHARED_LIBS bị đổi)
+          find llama.cpp/build-android -name '*.so' -exec cp {} "$ROOT/lib/" \; 2>/dev/null || true
+          for so in "$ROOT"/lib/*.so; do
+            [ -f "$so" ] && "$STRIP" --strip-unneeded "$so"
           done
 
           # Script kiểm tra RAM
-          cat > $ROOT/bin/llama-check-ram <<'EOF'
+          cat > "$ROOT/bin/llama-check-ram" <<'EOF'
           #!/data/data/com.termux/files/usr/bin/bash
           MIN_MB=${1:-2048}
           AVAIL_MB=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 1024 ))
@@ -114,67 +306,126 @@ jobs:
           fi
           echo "[OK] RAM trống: ${AVAIL_MB}MB."
           EOF
-          chmod +x $ROOT/bin/llama-check-ram
+          chmod +x "$ROOT/bin/llama-check-ram"
 
           # Metadata gói
-          mkdir -p $PKG/DEBIAN
-          cat > $PKG/DEBIAN/control <<EOF
-          Package: llama-termux
-          Version: 0.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}+${GITHUB_SHA::7}
-          Architecture: aarch64
+          mkdir -p "$PKG/DEBIAN"
+          INSTALLED_KB=$(du -sk "$PKG/data" | cut -f1)
+          cat > "$PKG/DEBIAN/control" <<EOF
+          Package: $PKG_NAME
+          Version: $VERSION
+          Architecture: $ARCH
           Maintainer: nam348tnh3gp
+          Installed-Size: $INSTALLED_KB
           Section: utils
           Priority: optional
-          Description: llama.cpp binaries for Termux (arm64-v8a, KleidiAI)
+          Conflicts: llama-cpp
+          Replaces: llama-cpp
+          Description: llama.cpp binaries for Termux ($ARCH, llama.cpp commit $LLAMA_SHA)
           EOF
 
-          # Kiểm tra dung lượng trước khi đóng gói (debug)
-          du -sh $ROOT/bin/* $ROOT/lib/* 2>/dev/null || true
+          du -sh "$ROOT"/bin/* "$ROOT"/lib/* 2>/dev/null || true
 
-          dpkg-deb --build $PKG llama-termux.deb
+          DEB="${PKG_NAME}_${VERSION}_${ARCH}.deb"
+          dpkg-deb --root-owner-group -Zxz --build "$PKG" "dist/$DEB"
+          ls -la dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama-termux-deb
-          path: llama-termux.deb
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
           retention-days: 7
+          if-no-files-found: error
 
-      - name: Resolve tag & release name
-        id: meta
+  # ---------------------------------------------------------------------------
+  # Gom tất cả .deb, tạo SHA256SUMS, tag và release một lần duy nhất.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [prepare, build]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout own repo (for tagging)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify packages & checksums
+        env:
+          REQUIRED: ${{ needs.prepare.outputs.required }}
         run: |
-          TAG="${{ inputs.tag_name }}"
-          if [ -z "$TAG" ]; then
-            TAG="build-$(date -u +%Y%m%d-%H%M%S)-r${GITHUB_RUN_NUMBER}"
-          fi
-          NAME="${{ inputs.release_name }}"
-          if [ -z "$NAME" ]; then
-            NAME="$TAG"
-          fi
-          echo "tag=$TAG"   >> $GITHUB_OUTPUT
-          echo "name=$NAME" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          ls -la dist
+          # Kiến trúc chính bắt buộc phải có; arm/i686 (experimental) thì tùy
+          for a in $REQUIRED; do
+            if ! ls dist/*_"$a".deb >/dev/null 2>&1; then
+              echo "::error::Thiếu gói cho kiến trúc bắt buộc: $a"
+              exit 1
+            fi
+          done
+          (cd dist && sha256sum *.deb > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Write release notes
+        env:
+          LLAMA_FULL: ${{ needs.prepare.outputs.llama_full }}
+          LLAMA_SHA: ${{ needs.prepare.outputs.llama_sha }}
+          LLAMA_REF: ${{ inputs.llama_ref || 'master' }}
+          CPU_ARCH: ${{ inputs.cpu_arch }}
+          X86_AVX2: ${{ inputs.x86_avx2 }}
+        run: |
+          FILES=$(for f in dist/*.deb; do printf -- '- `%s`\n' "$(basename "$f")"; done)
+          cat > release-notes.md <<EOF
+          Build thủ công llama.cpp cho Termux.
+
+          - llama.cpp: [\`$LLAMA_SHA\`](https://github.com/ggml-org/llama.cpp/commit/$LLAMA_FULL) (ref: \`$LLAMA_REF\`)
+          - Repo build: commit ${GITHUB_SHA::7}, run #${GITHUB_RUN_NUMBER}
+          - NDK: r27d, android-28
+          - aarch64: KleidiAI bật, CPU arch \`${CPU_ARCH:-baseline armv8-a}\`
+          - x86_64: AVX2 \`$X86_AVX2\`
+          - arm (armv7) và i686 là bản experimental
+          - Yêu cầu: Termux, Android 9+, RAM trống ≥ 2GB
+
+          Gói trong release:
+
+          $FILES
+
+          Cài đặt (chọn đúng kiến trúc của máy, xem bằng \`dpkg --print-architecture\`):
+
+          \`\`\`
+          pkg install ./llama-termux_*_<arch>.deb
+          \`\`\`
+
+          Kiểm tra toàn vẹn bằng \`SHA256SUMS\`.
+          EOF
 
       - name: Create tag
-        working-directory: self-repo
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git ls-remote --tags origin "${{ steps.meta.outputs.tag }}" | grep -q .; then
-            echo "::error::Tag '${{ steps.meta.outputs.tag }}' đã tồn tại. Chọn tên khác."
-            exit 1
-          fi
-          git tag "${{ steps.meta.outputs.tag }}"
-          git push origin "${{ steps.meta.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.name }}
-          body: |
-            Build thủ công từ llama.cpp master.
-            - Commit: ${{ github.sha }}
-            - Run: #${{ github.run_number }}
-            - Yêu cầu: RAM trống ≥ 2GB, Termux arm64.
-          files: llama-termux.deb
-          make_latest: ${{ inputs.make_latest == 'true' }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.name }}
+          body_path: release-notes.md
+          files: |
+            dist/*.deb
+            dist/SHA256SUMS
+          make_latest: ${{ inputs.make_latest }}
+          prerelease: ${{ inputs.prerelease }}
